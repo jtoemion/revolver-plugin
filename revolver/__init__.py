@@ -83,6 +83,22 @@ def register(ctx) -> None:
     )
 
     # -------------------------------------------------------------------------
+    # Helper: call set_runtime_main so Hermes immediately routes to the
+    # new provider/model without waiting for the agent to act on a message.
+    # -------------------------------------------------------------------------
+    def _apply_runtime_main(cylinders, state: CylinderState) -> None:
+        """Push the active delegation into Hermes's live routing globals."""
+        try:
+            from agent.auxiliary_client import set_runtime_main
+        except ImportError:
+            return
+        if not cylinders or state.state == "ALL_EXHAUSTED" or state.cylinder >= len(cylinders):
+            return
+        cyl = cylinders[state.cylinder]
+        api_key = cyl.get_bullet_key(state.bullet) if state.bullet >= 0 else ""
+        set_runtime_main(cyl.provider, cyl.model, api_key=api_key or "")
+
+    # -------------------------------------------------------------------------
     # Helper: perform a locked state mutation
     # Returns (new_state, ok). ok=False means lock contention (do not block).
     # -------------------------------------------------------------------------
@@ -126,6 +142,7 @@ def register(ctx) -> None:
                 s.bullet, len(_cylinders[s.cylinder].bullets) if s.cylinder < len(_cylinders) else 0,
                 s.state,
             )
+            _apply_runtime_main(_cylinders, s)
         else:
             logger.info("[revolver] Session %s — ALL_EXHAUSTED", session_id or "(unknown)")
 
@@ -337,13 +354,19 @@ def register(ctx) -> None:
                     recovery_interval = 300.0
                 start_recovery_check(recovery_interval)
 
-            # Only inject when the provider/model actually changes (cylinder
-            # boundary crossed) or when ALL_EXHAUSTED. Injecting on every
-            # intra-cylinder bullet rotation triggers a new agent response call,
-            # which hits the API, which 429s again — an inject loop.
-            cylinder_changed = new_state.cylinder != old_cylinder
             now_exhausted = new_state.state == "ALL_EXHAUSTED" or new_state.cylinder >= len(_cylinders)
 
+            # Always push the new provider/model into Hermes's live routing so
+            # the next API call is automatically directed at the right target.
+            # This is the actual automatic switch — set_runtime_main updates the
+            # globals that every subsequent call_llm reads.
+            _apply_runtime_main(_cylinders, new_state)
+
+            # Only inject a visible message when the provider/model changes
+            # (cylinder crossed) or ALL_EXHAUSTED. Injecting on every
+            # intra-cylinder bullet rotation triggers a new agent response call
+            # → 429 → inject again → infinite loop.
+            cylinder_changed = new_state.cylinder != old_cylinder
             if cylinder_changed or now_exhausted:
                 if now_exhausted:
                     msg = (
@@ -353,9 +376,9 @@ def register(ctx) -> None:
                 else:
                     active = _cylinders[new_state.cylinder]
                     msg = (
-                        f"[revolver] Provider changed after {status_code} ({action}). "
-                        f"Use provider={active.provider} model={active.model} for the next "
-                        f"delegated request. cylinder={new_state.cylinder} state={new_state.state}"
+                        f"[revolver] Switched provider after {status_code} ({action}): "
+                        f"now using provider={active.provider} model={active.model}. "
+                        f"cylinder={new_state.cylinder} state={new_state.state}"
                     )
                 ctx.inject_message(msg, role="user")
 
@@ -423,6 +446,7 @@ def register(ctx) -> None:
             log_event("cylinder_exhausted", log_ctx)
         else:
             log_event("bullet_advanced", log_ctx)
+        _apply_runtime_main(_cylinders, new_state)
         cyl = _cylinders[new_state.cylinder]
         key = cyl.get_bullet_key(new_state.bullet)
         key_info = f" key={describe_secret(key)}"
@@ -509,6 +533,7 @@ def register(ctx) -> None:
             "state": new_state.state,
             "consecutive_failures": new_state.consecutive_failures,
         })
+        _apply_runtime_main(_cylinders, new_state)
         return "[revolver] Reset — cylinder=0 bullet=-1 state=CYLINDER_ACTIVE"
 
     ctx.register_command(
