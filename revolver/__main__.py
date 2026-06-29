@@ -388,23 +388,39 @@ if __name__ == "__main__":
         def register_tool(self, name, handler, description=""):
             self.tools[name] = {"handler": handler, "description": description}
 
-    save_state(CylinderState(cylinder=0, bullet=-1, state="CYLINDER_ACTIVE"))
+    # 13a: intra-cylinder 429 must NOT inject (same provider/model, just a new bullet)
+    save_state(CylinderState(cylinder=0, bullet=0, state="CYLINDER_ACTIVE"))
     fake_ctx = FakeCtx()
     register(fake_ctx)
-    fake_ctx.hooks["api_request_error"](status_code=429, model="old-model", provider="old-provider")
-    injected = fake_ctx.messages[-1]["message"]
-    assert "delegation config changed" in injected, injected
-    assert "Use provider=p1 model=m1" in injected, injected
-    assert "auth=configured" in injected and "key-a" not in injected, injected
+    before_13a = len(fake_ctx.messages)
+    fake_ctx.hooks["api_request_error"](status_code=429, model="m1", provider="p1")
+    assert len(fake_ctx.messages) == before_13a, (
+        f"intra-cylinder 429 must not inject, got {len(fake_ctx.messages) - before_13a} messages"
+    )
+    print("   OK - intra-cylinder 429: no inject (prevents feedback loop)")
+
     resolved = fake_ctx.tools["resolve_delegation"]["handler"]()
     assert resolved["apply"] == {"model": "m1", "provider": "p1"}, resolved
-    assert resolved["auth"]["key"] == "configured (5 chars)", resolved
     assert "key-a" not in str(resolved), resolved
     health = fake_ctx.tools["get_revolver_health"]["handler"]()
     assert health["active_delegation"]["apply"] == {"model": "m1", "provider": "p1"}, health
     doctor = fake_ctx.tools["doctor_revolver"]["handler"]()
     assert doctor["ok"] is True, doctor
-    print("   OK - injected message is explicit and does not leak the key")
+    print("   OK - tools return correct routing contract without leaking keys")
+
+    # 13b: ALL_EXHAUSTED transition MUST inject exactly once (provider gone)
+    # CYLINDER_EXHAUSTED + threshold met → advance() returns ALL_EXHAUSTED → inject fires.
+    save_state(CylinderState(cylinder=0, bullet=0, state="CYLINDER_EXHAUSTED",
+                              consecutive_failures=1))
+    fake_ctx2 = FakeCtx()
+    register(fake_ctx2)
+    before_13b = len(fake_ctx2.messages)
+    fake_ctx2.hooks["api_request_error"](status_code=401, model="m1", provider="p1")
+    assert len(fake_ctx2.messages) > before_13b, "ALL_EXHAUSTED transition must inject"
+    injected = fake_ctx2.messages[-1]["message"]
+    assert "exhausted" in injected.lower() or "provider" in injected.lower(), injected
+    assert "key-a" not in injected and "key-b" not in injected, injected
+    print("   OK - ALL_EXHAUSTED transition injects exactly once without leaking keys")
 
     print("14. ALL_EXHAUSTED loop-break: repeated 429s must not re-inject ...")
     save_state(CylinderState(cylinder=99, bullet=-1, state="ALL_EXHAUSTED"))

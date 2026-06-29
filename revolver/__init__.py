@@ -301,6 +301,7 @@ def register(ctx) -> None:
                 # Transient / unknown — do not rotate; retry in place
                 return s
 
+        old_cylinder = _current.cylinder
         new_state, acquired = _mutate(_make_transition)
 
         if acquired:
@@ -336,33 +337,27 @@ def register(ctx) -> None:
                     recovery_interval = 300.0
                 start_recovery_check(recovery_interval)
 
-        def _rotation_message(s: CylinderState) -> str:
-            if s.state == "ALL_EXHAUSTED" or s.cylinder >= len(_cylinders):
-                return (
-                    f"[revolver] After {status_code} ({action}): delegation config changed. "
-                    f"state=ALL_EXHAUSTED; no provider/model is currently available. "
-                    f"Do not keep using the previous delegation target; ask for /revolver reset "
-                    f"or wait for recovery."
-                )
-            active = _cylinders[s.cylinder]
-            return (
-                f"[revolver] After {status_code} ({action}): delegation config changed. "
-                f"Use provider={active.provider} model={active.model} for the next delegated "
-                f"request. cylinder={s.cylinder} bullet={s.bullet} state={s.state} "
-                f"auth={describe_secret(active.get_bullet_key(s.bullet))}."
-            )
+            # Only inject when the provider/model actually changes (cylinder
+            # boundary crossed) or when ALL_EXHAUSTED. Injecting on every
+            # intra-cylinder bullet rotation triggers a new agent response call,
+            # which hits the API, which 429s again — an inject loop.
+            cylinder_changed = new_state.cylinder != old_cylinder
+            now_exhausted = new_state.state == "ALL_EXHAUSTED" or new_state.cylinder >= len(_cylinders)
 
-        if acquired:
-            ctx.inject_message(
-                _rotation_message(new_state),
-                role="user",
-            )
-        else:
-            ctx.inject_message(
-                f"[revolver] {status_code} ({action}) but lock contention — "
-                f"state unchanged; retry manually with /revolver next",
-                role="user",
-            )
+            if cylinder_changed or now_exhausted:
+                if now_exhausted:
+                    msg = (
+                        f"[revolver] After {status_code} ({action}): all providers exhausted. "
+                        f"No delegation target available. Use /revolver reset or wait for recovery."
+                    )
+                else:
+                    active = _cylinders[new_state.cylinder]
+                    msg = (
+                        f"[revolver] Provider changed after {status_code} ({action}). "
+                        f"Use provider={active.provider} model={active.model} for the next "
+                        f"delegated request. cylinder={new_state.cylinder} state={new_state.state}"
+                    )
+                ctx.inject_message(msg, role="user")
 
     # -------------------------------------------------------------------------
     # /revolver next
