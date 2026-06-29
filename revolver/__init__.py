@@ -96,7 +96,12 @@ def register(ctx) -> None:
             return
         cyl = cylinders[state.cylinder]
         api_key = cyl.get_bullet_key(state.bullet) if state.bullet >= 0 else ""
-        set_runtime_main(cyl.provider, cyl.model, api_key=api_key or "")
+        set_runtime_main(
+            cyl.provider,
+            cyl.model,
+            base_url=cyl.base_url or "",
+            api_key=api_key or "",
+        )
 
     # -------------------------------------------------------------------------
     # Helper: perform a locked state mutation
@@ -763,6 +768,8 @@ def register(ctx) -> None:
         """Serialize a CylinderDef to a plain dict for YAML."""
         entry = {"delegation": dict(c.delegation)}
         entry["bullets"] = [_denormalize_bullet(b) for b in c.bullets]
+        if c.base_url:
+            entry["base_url"] = c.base_url
         if c.cooldown_seconds != 60:
             entry["cooldown_seconds"] = c.cooldown_seconds
         if c.consecutive_failures_threshold != 2:
@@ -816,22 +823,24 @@ def register(ctx) -> None:
             lines = [f"[revolver] Cylinders ({len(_cylinders)}):"]
             for i, c in enumerate(_cylinders):
                 bullets = len(c.bullets)
+                base = f" [{c.base_url}]" if c.base_url else ""
                 lines.append(
-                    f"  [{i}] {c.provider}/{c.model} "
+                    f"  [{i}] {c.provider}/{c.model}{base} "
                     f"({bullets} bullet{'s' if bullets != 1 else ''})"
                     f"{' ● active' if i == load_state().cylinder else ''}"
                 )
             return "\n".join(lines)
 
         elif subcmd == "add":
-            # parse: add <model> <provider> [--cooldown N] [--probe-url URL]
+            # parse: add <model> <provider> [--base-url URL] [--cooldown N] [--probe-url URL]
             kwargs, rest = _parse_flag_args(parts[1:])
             if len(rest) < 2:
-                return "Usage: /revolver cylinder add <model> <provider> [--cooldown N] [--probe-url URL]"
+                return "Usage: /revolver cylinder add <model> <provider> [--base-url URL] [--cooldown N] [--probe-url URL]"
             model, provider = rest[0], rest[1]
             new_cyl = CylinderDef(
                 delegation={"model": model, "provider": provider},
                 bullets=[],
+                base_url=kwargs.get("base-url") or kwargs.get("base_url"),
                 cooldown_seconds=int(kwargs.get("cooldown", 60)),
                 probe_url=kwargs.get("probe_url"),
             )
@@ -845,9 +854,9 @@ def register(ctx) -> None:
             return f"[revolver] Added cylinder [{len(updated)-1}] {provider}/{model}"
 
         elif subcmd == "edit":
-            # edit <idx> [--model m] [--provider p] [--cooldown N] [--probe-url URL] [--threshold N]
+            # edit <idx> [--model m] [--provider p] [--base-url URL] [--cooldown N] [--probe-url URL] [--threshold N]
             if not parts[1:]:
-                return "Usage: /revolver cylinder edit <idx> [--model m] [--provider p] [--cooldown N] [--probe-url URL] [--threshold N]"
+                return "Usage: /revolver cylinder edit <idx> [--model m] [--provider p] [--base-url URL] [--cooldown N] [--probe-url URL] [--threshold N]"
             try:
                 idx = int(parts[1])
             except ValueError:
@@ -856,17 +865,19 @@ def register(ctx) -> None:
                 return f"Index {idx} out of range (0-{len(_cylinders)-1})"
             kwargs, _ = _parse_flag_args(parts[2:])
             if not kwargs:
-                return "No edits specified. Use --model, --provider, --cooldown, --probe-url, --threshold"
+                return "No edits specified. Use --model, --provider, --base-url, --cooldown, --probe-url, --threshold"
             c = _cylinders[idx]
             delegation = dict(c.delegation)
             if "model" in kwargs:
                 delegation["model"] = kwargs["model"]
             if "provider" in kwargs:
                 delegation["provider"] = kwargs["provider"]
+            new_base_url = kwargs.get("base-url") or kwargs.get("base_url", c.base_url)
             updated = list(_cylinders)
             updated[idx] = CylinderDef(
                 delegation=delegation,
                 bullets=list(c.bullets),
+                base_url=new_base_url,
                 cooldown_seconds=int(kwargs.get("cooldown", c.cooldown_seconds)),
                 consecutive_failures_threshold=int(
                     kwargs.get("threshold", c.consecutive_failures_threshold)
@@ -997,6 +1008,7 @@ def register(ctx) -> None:
             updated[cyl_idx] = CylinderDef(
                 delegation=dict(c.delegation),
                 bullets=list(c.bullets) + [new_bullet],
+                base_url=c.base_url,
                 cooldown_seconds=c.cooldown_seconds,
                 consecutive_failures_threshold=c.consecutive_failures_threshold,
                 probe_url=c.probe_url,
@@ -1042,6 +1054,7 @@ def register(ctx) -> None:
             updated[cyl_idx] = CylinderDef(
                 delegation=dict(c.delegation),
                 bullets=bullets,
+                base_url=c.base_url,
                 cooldown_seconds=c.cooldown_seconds,
                 consecutive_failures_threshold=c.consecutive_failures_threshold,
                 probe_url=c.probe_url,
@@ -1072,6 +1085,7 @@ def register(ctx) -> None:
             updated[cyl_idx] = CylinderDef(
                 delegation=dict(c.delegation),
                 bullets=bullets,
+                base_url=c.base_url,
                 cooldown_seconds=c.cooldown_seconds,
                 consecutive_failures_threshold=c.consecutive_failures_threshold,
                 probe_url=c.probe_url,

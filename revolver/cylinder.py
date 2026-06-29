@@ -114,6 +114,7 @@ class CylinderDef:
     cooldown_seconds: int = 60
     consecutive_failures_threshold: int = 2   # N 401s before advancing bullet
     probe_url: Optional[str] = None      # optional health probe URL before exhausting
+    base_url: Optional[str] = None       # OpenAI-compatible endpoint URL for this provider
 
     @property
     def model(self) -> str:
@@ -252,6 +253,10 @@ def load_revolver_yaml() -> List[CylinderDef]:
         if probe_url is not None and not isinstance(probe_url, str):
             raise ValueError(f"Cylinder {i}: probe_url must be a string if provided")
 
+        base_url = c.get("base_url")
+        if base_url is not None and not isinstance(base_url, str):
+            raise ValueError(f"Cylinder {i}: base_url must be a string if provided")
+
         key = (model, provider)
         if key in seen:
             raise ValueError(
@@ -266,6 +271,7 @@ def load_revolver_yaml() -> List[CylinderDef]:
             cooldown_seconds=cooldown,
             consecutive_failures_threshold=threshold,
             probe_url=probe_url,
+            base_url=base_url,
         ))
 
     return parsed
