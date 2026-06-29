@@ -1,0 +1,39 @@
+name: revolver
+version: "1.0.0"
+description: >
+  Cascading fallback plugin for Hermes delegation config — a revolver cylinder model.
+
+  Manages a chain of delegation configurations (model, provider, API keys) as
+  "cylinders", each with one or more "bullets" (API keys). On API errors the
+  plugin classifies the failure and either advances the bullet, sets a
+  per-bullet cooldown, or retries in place — providing resilient,
+  stateful fallback across the chain.
+
+  State persists in ~/.hermes/.revolver_state.json so it survives restarts.
+  Cylinder definitions live in ~/.hermes/revolver.yaml (not config.yaml).
+
+  Hooks registered:
+    on_session_start  — log current cylinder/bullet on session start
+    api_request_error — classify error and advance/cooldown/retry
+
+  Commands:
+    /revolver next          — advance one bullet or cylinder
+    /revolver status        — show current cylinder, bullet, state
+    /revolver graph         — ASCII fallback chain with current position
+    /revolver reset         — reset to cylinder 0, bullet -1, state CYLINDER_ACTIVE
+    /revolver log           — show the last 20 rotation events
+    /revolver tool          — show active delegation snapshot
+    /revolver cylinder      — CRUD: list, add, edit, remove, move cylinders
+    /revolver bullet        — CRUD: list, add, edit, remove bullets
+
+  Tool exposed:
+    get_active_delegation   — JSON dict: {model, provider, cylinder, bullet, state}
+
+author: jtoemion
+requires_env: []
+provides_tools:
+  - get_active_delegation
+provides_hooks:
+  - on_session_start
+  - api_request_error
+kind: standalone

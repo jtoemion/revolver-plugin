@@ -1,0 +1,87 @@
+# =============================================================================
+# revolver.example.yaml — Example cylinder definitions for the Revolver plugin
+# =============================================================================
+#
+# Copy this file to ~/.hermes/revolver.yaml and edit to match your setup.
+# Each cylinder is one delegation target with one or more API key "bullets".
+#
+# The revolver rotates through bullets on auth failure (401) and rate-limits
+# (429). When a cylinder's bullets are exhausted it moves to the next cylinder.
+# When all cylinders are exhausted it starts a background recovery thread.
+#
+# ---------------------------------------------------------------------------
+# Bullet formats (two forms accepted)
+# ---------------------------------------------------------------------------
+#   Plain string → type is inferred as "bearer"
+#     - sk-or-v1-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+#
+#   Dict        → {key, type?, cooldown_seconds?, label?}
+#     - key: sk-or-v1-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+#       type: x-api-key
+#       cooldown_seconds: 30
+#       label: my-key-label
+#
+#   Fields:
+#     key              : required — the actual API key string (non-empty)
+#     type             : optional — "bearer" (default), "x-api-key", "custom"
+#     cooldown_seconds : optional — per-bullet cooldown override (default: cylinder-level)
+#     label            : optional — human-readable label for graph display
+#
+# ---------------------------------------------------------------------------
+# Cylinder-level fields
+# ---------------------------------------------------------------------------
+#   delegation:
+#     model:    (required) — model name string
+#     provider: (required) — provider name; "openrouter", "custom:nara", etc.
+#   bullets:              — list of bullet entries (see above)
+#   cooldown_seconds:     — default cooldown for all bullets in this cylinder (default: 60)
+#   consecutive_failures_threshold: — N 401s before advancing to next bullet (default: 2)
+#   probe_url:            — optional health-check URL before exhausting cylinder
+# =============================================================================
+
+cylinders:
+  # ── Cylinder 0: primary provider ─────────────────────────────────────────
+  - delegation:
+      model: poolside/laguna-m.1:free
+      provider: openrouter
+    bullets:
+      - sk-or-v1-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+      - key: sk-or-v1-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+        type: x-api-key
+        cooldown_seconds: 30
+    cooldown_seconds: 60
+    # consecutive_failures_threshold: 2    # default — uncomment to change
+    # probe_url: https://openrouter.ai/api/v1/auth/key    # optional health check
+
+  # ── Cylinder 1: fallback provider ────────────────────────────────────────
+  - delegation:
+      model: deepseek-v4-flash-free
+      provider: opencode-zen
+    bullets:
+      - sk-zen-key-11111111111111111111111111111111111111111111111111111
+      - sk-zen-key-22222222222222222222222222222222222222222222222222222
+      - sk-zen-key-33333333333333333333333333333333333333333333333333333
+    cooldown_seconds: 60
+
+  # ── Cylinder 2: custom provider (requires custom_providers in config.yaml) ─
+  #   Add to ~/.hermes/config.yaml:
+  #     custom_providers:
+  #       - name: nara
+  #         base_url: https://router.example.com/v1
+  #         key_env: NARA_API_KEY
+  #         api_mode: chat_completions
+  - delegation:
+      model: mimo-v2.5-free
+      provider: custom:nara
+    bullets:
+      - sk-nry-key-11111111111111111111111111111111111111111111111111
+      - sk-nry-key-22222222222222222222222222222222222222222222222222
+
+  # ── Cylinder 3: last resort ──────────────────────────────────────────────
+  - delegation:
+      model: MiniMax-M2.7
+      provider: minimax
+    bullets:
+      - key: mm-sk-key-xxxxxxxxxxxxx
+        type: x-api-key
+    cooldown_seconds: 120
