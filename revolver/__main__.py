@@ -11,15 +11,50 @@ Tests cylinder + bullets modules independently without a Hermes environment.
 if __name__ == "__main__":
     import sys
     import os
+    import tempfile
+    from pathlib import Path
+
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")
 
     # Ensure parent dir is on sys.path for package imports
     _parent = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     if _parent not in sys.path:
         sys.path.insert(0, _parent)
 
+    import revolver.bullets as bullets_mod
+    import revolver.cylinder as cylinder_mod
+
+    _tmp = tempfile.TemporaryDirectory(prefix="revolver-self-test-")
+    _hermes_home = Path(_tmp.name) / ".hermes"
+    _hermes_home.mkdir(parents=True, exist_ok=True)
+    bullets_mod.HERMES_HOME = _hermes_home
+    bullets_mod.EVENT_LOG_FILE = _hermes_home / ".revolver_events.log"
+    cylinder_mod.HERMES_HOME = _hermes_home
+    cylinder_mod.REVOLVER_YAML = _hermes_home / "revolver.yaml"
+    cylinder_mod.STATE_FILE = _hermes_home / ".revolver_state.json"
+    cylinder_mod.LOCK_FILE = _hermes_home / ".revolver.lock"
+    cylinder_mod.REVOLVER_YAML.write_text(
+        "cylinders:\n"
+        "  - delegation:\n"
+        "      model: m1\n"
+        "      provider: p1\n"
+        "    bullets:\n"
+        "      - key-a\n"
+        "      - key: key-b\n"
+        "        type: x-api-key\n"
+        "        cooldown_seconds: 30\n"
+        "error_policy:\n"
+        "  advance: [401]\n"
+        "  cooldown: [429, 529]\n"
+        "  transient: [408, 502, 503]\n",
+        encoding="utf-8",
+    )
+
     # Import directly from the submodules for testing
     from revolver.bullets import (
         normalize_bullet,
+        normalize_error_policy,
         mark_bullet_cooldown,
         is_bullet_available,
         clear_bullet_cooldowns,
@@ -30,12 +65,18 @@ if __name__ == "__main__":
         CylinderState,
         STATE_FILE,
         advance,
+        doctor_revolver_config,
         format_graph,
         get_active_delegation,
+        get_active_delegation_dict,
+        get_health_snapshot,
+        load_error_policy,
         load_revolver_yaml,
         load_state,
+        resolve_active_delegation,
         save_state,
     )
+    from revolver import register
 
     # Smoke-test: load yaml and state without a full Hermes environment
     print("=== revolver self-test ===")
@@ -65,11 +106,11 @@ if __name__ == "__main__":
     n = normalize_bullet("sk-or-v1-aaa")
     assert n == {"key": "sk-or-v1-aaa", "type": "bearer", "cooldown_seconds": None, "label": None}
     n = normalize_bullet({"key": "sk-or-v1-bbb", "type": "x-api-key", "cooldown_seconds": 30})
-    assert n == {"key": "sk-or-v1-bbb", "type": "x-api-key", "cooldown_seconds": 30, "label": None}
+    assert n == {"key": "sk-or-v1-bbb", "type": "x-api-key", "cooldown_seconds": 30.0, "label": None}
     n = normalize_bullet({"key": "mm-sk-xxx"})
     assert n == {"key": "mm-sk-xxx", "type": "bearer", "cooldown_seconds": None, "label": None}
     n = normalize_bullet({"key": "sk-or-v1-ccc", "type": "bearer", "cooldown_seconds": 15, "label": "openrouter-1"})
-    assert n == {"key": "sk-or-v1-ccc", "type": "bearer", "cooldown_seconds": 15, "label": "openrouter-1"}
+    assert n == {"key": "sk-or-v1-ccc", "type": "bearer", "cooldown_seconds": 15.0, "label": "openrouter-1"}
     n = normalize_bullet({"key": "sk-or-v1-ddd", "label": 123})
     assert n == {"key": "sk-or-v1-ddd", "type": "bearer", "cooldown_seconds": None, "label": None}
     try:
@@ -82,6 +123,16 @@ if __name__ == "__main__":
         assert False, "should have raised ValueError"
     except ValueError as e:
         assert "non-empty" in str(e)
+    try:
+        normalize_bullet("   ")
+        assert False, "should have raised ValueError"
+    except ValueError as e:
+        assert "non-empty" in str(e)
+    try:
+        normalize_bullet({"key": "x", "cooldown_seconds": -1})
+        assert False, "should have raised ValueError"
+    except ValueError as e:
+        assert ">= 0" in str(e)
     try:
         normalize_bullet(123)
         assert False, "should have raised ValueError"
@@ -112,6 +163,19 @@ if __name__ == "__main__":
         result = classify_error(code)
         assert result == expected, f"classify_error({code}) = {result}, expected {expected}"
     print(f"   OK — all {len(checks)} classifications correct")
+
+    print("3b. Configurable error policy ...")
+    policy = load_error_policy()
+    assert classify_error(529, policy) == "cooldown"
+    assert classify_error(500, policy) == "unknown"
+    merged = normalize_error_policy({"advance": [401, "403"]})
+    assert classify_error(403, merged) == "advance"
+    try:
+        normalize_error_policy({"advance": [401], "cooldown": [401]})
+        assert False, "duplicate policy status should fail"
+    except ValueError as e:
+        assert "appears in both" in str(e)
+    print("   OK - custom policy loaded and validated")
 
     print("4. advance wraps infinitely (no exhaustion tracking) ...")
     cyls_wrap = [
@@ -160,6 +224,26 @@ if __name__ == "__main__":
     assert model is None, f"ALL_EXHAUSTED must return None, got {model}"
     print("   OK")
 
+    print("6b. Active delegation resolver returns an apply contract ...")
+    contract = get_active_delegation_dict(
+        cyls_test, CylinderState(cylinder=0, bullet=0, state="CYLINDER_ACTIVE"))
+    assert contract["active"] is True
+    assert contract["apply"] == {"model": "m1", "provider": "p1"}
+    assert contract["auth"]["type"] == "bearer"
+    assert contract["auth"]["key_configured"] is True
+    assert contract["auth"]["key"] == "configured (1 chars)"
+    secret_contract = resolve_active_delegation(
+        cyls_test,
+        CylinderState(cylinder=0, bullet=0, state="CYLINDER_ACTIVE"),
+        include_secret=True,
+    )
+    assert secret_contract["auth"]["key"] == "a"
+    exhausted_contract = get_active_delegation_dict(
+        cyls_test, CylinderState(cylinder=99, bullet=0, state="ALL_EXHAUSTED"))
+    assert exhausted_contract["active"] is False
+    assert exhausted_contract["apply"] is None
+    print("   OK - resolver gives hosts direct provider/model fields")
+
     print("7. Bullet cooldown helpers ...")
     state = CylinderState()
     assert is_bullet_available(state.bullet_cooldowns, 0), "bullet 0 available initially"
@@ -171,6 +255,24 @@ if __name__ == "__main__":
     assert is_bullet_available(state.bullet_cooldowns, 0), "bullet 0 available after clear"
     assert is_bullet_available(state.bullet_cooldowns, 1), "bullet 1 available after clear"
     print("   OK")
+
+    print("7b. Health snapshot is redacted and structured ...")
+    health_state = CylinderState(cylinder=0, bullet=0, state="CYLINDER_ACTIVE")
+    mark_bullet_cooldown(health_state.bullet_cooldowns, 1, 30)
+    health = get_health_snapshot(cyls_test, health_state)
+    assert health["ok"] is True
+    assert health["active_delegation"]["apply"] == {"model": "m1", "provider": "p1"}
+    assert health["active_delegation"]["auth"]["key"] == "configured (1 chars)"
+    assert health["cooldowns"][0]["bullet"] == 1
+    print("   OK - health includes apply contract and cooldowns")
+
+    print("7c. Doctor validates local setup ...")
+    doctor = doctor_revolver_config()
+    assert doctor["ok"] is True, doctor
+    assert doctor["cylinders"] == 1
+    assert doctor["bullets"] == 2
+    assert doctor["policy"]["cooldown"] == [429, 529]
+    print("   OK - doctor reports config, counts, and policy")
 
     print("8. advance finds available bullet when one is in cooldown ...")
     cyls_2 = [
@@ -194,6 +296,34 @@ if __name__ == "__main__":
     mark_bullet_cooldown(s.bullet_cooldowns, 1, 9999.0)
     s, status = advance(cyls_2, s)
     assert status == "ALL_COOLDOWN", f"expected ALL_COOLDOWN, got status={status}"
+    print("   OK")
+
+    print("9b. exhausted cylinder advances to the next usable cylinder ...")
+    cyls_chain = [
+        CylinderDef(delegation={"model": "m1", "provider": "p1"},
+                    bullets=[{"key": "a", "type": "bearer", "cooldown_seconds": None}],
+                    cooldown_seconds=60),
+        CylinderDef(delegation={"model": "empty", "provider": "p-empty"},
+                    bullets=[],
+                    cooldown_seconds=60),
+        CylinderDef(delegation={"model": "m2", "provider": "p2"},
+                    bullets=[{"key": "b", "type": "bearer", "cooldown_seconds": None}],
+                    cooldown_seconds=60),
+    ]
+    s = CylinderState(cylinder=0, bullet=0, state="CYLINDER_EXHAUSTED")
+    s, status = advance(cyls_chain, s)
+    assert status == "EXHAUSTED", f"expected EXHAUSTED, got {status}"
+    assert s.cylinder == 2 and s.bullet == 0 and s.state == "CYLINDER_ACTIVE", \
+        f"expected cylinder 2 bullet 0 active, got {s}"
+    assert s.bullet_cooldowns == {}, "new cylinder must not inherit previous bullet cooldowns"
+    print("   OK - skipped empty cylinder and selected next usable bullet")
+
+    print("9c. exhausted last cylinder becomes ALL_EXHAUSTED ...")
+    s = CylinderState(cylinder=2, bullet=0, state="CYLINDER_EXHAUSTED")
+    s, status = advance(cyls_chain, s)
+    assert status == "ALL_EXHAUSTED", f"expected ALL_EXHAUSTED, got {status}"
+    assert s.state == "ALL_EXHAUSTED" and s.cylinder == len(cyls_chain), \
+        f"expected terminal exhausted state, got {s}"
     print("   OK")
 
     print("10. 429 cooldown triggers per-bullet cooldown + advance ...")
@@ -235,9 +365,51 @@ if __name__ == "__main__":
         f"exhausted cylinder should show \u25cb only (no \u2299), got:\n{graph2}"
     print(f"   exhausted OK\n{graph2}")
 
+    print("13. Hook injection tells agents which delegation config to use ...")
+
+    class FakeCtx:
+        def __init__(self):
+            self.hooks = {}
+            self.messages = []
+            self.tools = {}
+
+        def on(self, name):
+            def _decorator(fn):
+                self.hooks[name] = fn
+                return fn
+            return _decorator
+
+        def inject_message(self, message, role="user"):
+            self.messages.append({"message": message, "role": role})
+
+        def register_command(self, *args, **kwargs):
+            return None
+
+        def register_tool(self, name, handler, description=""):
+            self.tools[name] = {"handler": handler, "description": description}
+
+    save_state(CylinderState(cylinder=0, bullet=-1, state="CYLINDER_ACTIVE"))
+    fake_ctx = FakeCtx()
+    register(fake_ctx)
+    fake_ctx.hooks["api_request_error"](status_code=429, model="old-model", provider="old-provider")
+    injected = fake_ctx.messages[-1]["message"]
+    assert "delegation config changed" in injected, injected
+    assert "Use provider=p1 model=m1" in injected, injected
+    assert "auth=configured" in injected and "key-a" not in injected, injected
+    resolved = fake_ctx.tools["resolve_delegation"]["handler"]()
+    assert resolved["apply"] == {"model": "m1", "provider": "p1"}, resolved
+    assert resolved["auth"]["key"] == "configured (5 chars)", resolved
+    assert "key-a" not in str(resolved), resolved
+    health = fake_ctx.tools["get_revolver_health"]["handler"]()
+    assert health["active_delegation"]["apply"] == {"model": "m1", "provider": "p1"}, health
+    doctor = fake_ctx.tools["doctor_revolver"]["handler"]()
+    assert doctor["ok"] is True, doctor
+    print("   OK - injected message is explicit and does not leak the key")
+
     # Clean up test state file
     if STATE_FILE.exists():
         STATE_FILE.unlink()
+    _tmp.cleanup()
 
     print("\n=== all tests passed ===")
     sys.exit(0)

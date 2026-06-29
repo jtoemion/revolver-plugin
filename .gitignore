@@ -21,6 +21,7 @@ venv/
 Thumbs.db
 
 # Hermes — do NOT commit actual state or config
+/revolver.yaml
 *.lock
 *.state.json
 *.events.log

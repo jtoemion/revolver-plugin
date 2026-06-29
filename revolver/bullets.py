@@ -12,6 +12,7 @@ import logging
 import os
 import time
 from pathlib import Path
+from urllib.parse import urlparse
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
@@ -30,6 +31,18 @@ _TRIM_LOG_LINES = 5_000
 # ---------------------------------------------------------------------------
 
 VALID_BULLET_TYPES = {"bearer", "x-api-key", "custom"}
+DEFAULT_ERROR_POLICY = {
+    "advance": [401],
+    "cooldown": [429],
+    "transient": [408, 502, 503],
+}
+
+
+def describe_secret(value: Optional[str]) -> str:
+    """Return a safe, non-reversible description for a configured secret."""
+    if not value:
+        return "(none)"
+    return f"configured ({len(value)} chars)"
 
 
 # ---------------------------------------------------------------------------
@@ -49,7 +62,10 @@ def normalize_bullet(b: Any) -> dict:
     label is optional and stored as-is (may be None or a string).
     """
     if isinstance(b, str):
-        return {"key": b, "type": "bearer", "cooldown_seconds": None, "label": None}
+        key = b.strip()
+        if not key:
+            raise ValueError("bullet 'key' must be a non-empty string")
+        return {"key": key, "type": "bearer", "cooldown_seconds": None, "label": None}
     if isinstance(b, dict):
         key = b.get("key", "")
         if not isinstance(key, str) or not key.strip():
@@ -59,10 +75,18 @@ def normalize_bullet(b: Any) -> dict:
             raise ValueError(
                 f"bullet 'type' must be one of {sorted(VALID_BULLET_TYPES)}, got {btype!r}"
             )
+        cooldown = b.get("cooldown_seconds")
+        if cooldown is not None:
+            try:
+                cooldown = float(cooldown)
+            except (TypeError, ValueError):
+                raise ValueError("bullet 'cooldown_seconds' must be a number") from None
+            if cooldown < 0:
+                raise ValueError("bullet 'cooldown_seconds' must be >= 0")
         return {
             "key": key.strip(),
             "type": btype,
-            "cooldown_seconds": b.get("cooldown_seconds"),
+            "cooldown_seconds": cooldown,
             "label": b.get("label") if isinstance(b.get("label"), str) else None,
         }
     raise ValueError(f"bullet must be a string or dict, got {type(b).__name__}")
@@ -75,8 +99,9 @@ def normalize_bullet(b: Any) -> dict:
 
 def mark_bullet_cooldown(bullet_cooldowns: dict, bullet_idx: int, duration: float) -> None:
     """Set a cooldown on the given bullet index, expiring at time.time() + duration."""
-    if bullet_cooldowns is None:
+    if bullet_cooldowns is None or bullet_idx < 0:
         return
+    duration = max(float(duration), 0.0)
     bullet_cooldowns[str(bullet_idx)] = time.time() + duration
 
 
@@ -117,7 +142,45 @@ def bullet_cooldown_str(bullet_cooldowns: dict, bullet_idx: int) -> str:
 # --------------------------------------------------------------------------
 
 
-def classify_error(status_code: Optional[int]) -> str:
+def _normalize_status_list(value: Any, field_name: str) -> List[int]:
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise ValueError(f"error_policy.{field_name} must be a list of HTTP status codes")
+    statuses: List[int] = []
+    for raw in value:
+        try:
+            status = int(raw)
+        except (TypeError, ValueError):
+            raise ValueError(f"error_policy.{field_name} entries must be integers") from None
+        if status < 100 or status > 599:
+            raise ValueError(f"error_policy.{field_name} entries must be valid HTTP status codes")
+        statuses.append(status)
+    return statuses
+
+
+def normalize_error_policy(raw: Any = None) -> dict:
+    """Validate and merge top-level error_policy config with defaults."""
+    if raw is None:
+        return {key: list(value) for key, value in DEFAULT_ERROR_POLICY.items()}
+    if not isinstance(raw, dict):
+        raise ValueError("error_policy must be a dict")
+    policy = {key: list(value) for key, value in DEFAULT_ERROR_POLICY.items()}
+    for key in ("advance", "cooldown", "transient"):
+        if key in raw:
+            policy[key] = _normalize_status_list(raw[key], key)
+    seen: Dict[int, str] = {}
+    for action, statuses in policy.items():
+        for status in statuses:
+            if status in seen:
+                raise ValueError(
+                    f"error_policy status {status} appears in both {seen[status]} and {action}"
+                )
+            seen[status] = action
+    return policy
+
+
+def classify_error(status_code: Optional[int], policy: Optional[dict] = None) -> str:
     """
     Classify an HTTP status code into an error handling action.
 
@@ -127,11 +190,14 @@ def classify_error(status_code: Optional[int]) -> str:
       transient — network/server error (408, 502, 503). Do NOT rotate. Retry in place.
       unknown   — anything else. Treat as transient (retry in place).
     """
-    if status_code == 401:
+    if status_code is None:
+        return "unknown"
+    active_policy = policy if policy is not None else normalize_error_policy()
+    if status_code in active_policy["advance"]:
         return "advance"
-    if status_code == 429:
+    if status_code in active_policy["cooldown"]:
         return "cooldown"
-    if status_code in (408, 502, 503):
+    if status_code in active_policy["transient"]:
         return "transient"
     return "unknown"
 
@@ -149,8 +215,17 @@ def probe_provider(url: str, timeout: float = 5.0) -> bool:
     """
     import urllib.request
 
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        logger.warning("[revolver] Refusing invalid probe_url scheme: %s", url)
+        return False
+
     try:
-        req = urllib.request.Request(url, method="HEAD")
+        req = urllib.request.Request(
+            url,
+            method="HEAD",
+            headers={"User-Agent": "revolver-plugin/1.0"},
+        )
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return 200 <= resp.status < 400
     except Exception:

@@ -1,6 +1,6 @@
-# Revolver Plugin — Cascading Fallback for Hermes Agent Delegation
+# Revolver Plugin � Reliability Layer for Hermes Agent Delegation
 
-The Revolver plugin gives Hermes a **self-healing delegation chain**. Think of it as a revolver cylinder: you load multiple "cylinders" (provider + model pairs), each with one or more "bullets" (API keys). When a request fails with an auth error (401) or rate-limit (429), the plugin automatically rotates to the next bullet or cylinder — your agent keeps working without you having to intervene.
+Revolver gives Hermes a **self-healing delegation chain**. Think of it as a reliability layer: you load multiple "cylinders" (provider + model pairs), each with one or more "bullets" (API keys). When a request fails according to your error policy, Revolver rotates to the next usable bullet or cylinder, exposes the provider/model contract through `resolve_delegation`, and keeps your agent from silently retrying a dead target.
 
 ```ascii
 Cylinder 0: openrouter / poolside/laguna-m.1:free  ● bullet 0/2 active
@@ -440,15 +440,36 @@ Examples:
 
 ### Tool Exposure
 
-The plugin exposes one tool to the Hermes agent itself (not the user):
+The plugin exposes routing tools to the Hermes agent itself (not the user):
 
-**`get_active_delegation`** — Returns a JSON dict: `{model, provider, cylinder, bullet, state}`. The host agent can call this to dynamically route delegation config to subagents. It's how the orchestrator plugin picks the right model/provider for spawned workers.
+**`resolve_delegation`** — Returns the provider/model contract the host must apply to the next delegated request. This is the control-plane API; integrations should use `apply.provider` and `apply.model` rather than inferring from chat messages.
+
+**`get_active_delegation`** — Back-compatible alias returning the same redacted routing contract for status and older integrations.
+
+**`get_revolver_health`** — Returns active routing, cooldowns, and recent event counts for dashboards, monitors, or agent self-checks.
+
+**`doctor_revolver`** — Validates local setup, policy config, cylinder/bullet counts, and safety warnings without exposing secrets.
 
 Example return:
 
 ```json
-{"model": "poolside/laguna-m.1:free", "provider": "openrouter",
- "cylinder": 0, "bullet": 1, "state": "CYLINDER_ACTIVE"}
+{
+  "active": true,
+  "model": "poolside/laguna-m.1:free",
+  "provider": "openrouter",
+  "cylinder": 0,
+  "bullet": 1,
+  "state": "CYLINDER_ACTIVE",
+  "apply": {
+    "provider": "openrouter",
+    "model": "poolside/laguna-m.1:free"
+  },
+  "auth": {
+    "type": "bearer",
+    "key_configured": true,
+    "key": "configured (64 chars)"
+  }
+}
 ```
 
 ### Hooks

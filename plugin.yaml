@@ -1,7 +1,7 @@
 name: revolver
 version: "1.0.0"
 description: >
-  Cascading fallback plugin for Hermes delegation config — a revolver cylinder model.
+  Reliability layer for Hermes delegation config — a revolver cylinder model.
 
   Manages a chain of delegation configurations (model, provider, API keys) as
   "cylinders", each with one or more "bullets" (API keys). On API errors the
@@ -27,12 +27,18 @@ description: >
     /revolver bullet        — CRUD: list, add, edit, remove bullets
 
   Tool exposed:
-    get_active_delegation   — JSON dict: {model, provider, cylinder, bullet, state}
+    get_active_delegation   — JSON routing contract with apply.provider/apply.model
+    resolve_delegation      — provider/model contract the host must apply next
+    get_revolver_health     — redacted operational health and recent event counts
+    doctor_revolver         — setup, policy, and safety validation findings
 
 author: jtoemion
 requires_env: []
 provides_tools:
   - get_active_delegation
+  - resolve_delegation
+  - get_revolver_health
+  - doctor_revolver
 provides_hooks:
   - on_session_start
   - api_request_error

@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hermes-revolver-plugin"
+version = "1.0.0"
+description = "Reliability layer for Hermes agent delegation with provider and key failover."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "jtoemion" }]
+dependencies = ["PyYAML>=6.0"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+revolver-selftest = "revolver.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["revolver*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

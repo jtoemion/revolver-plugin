@@ -14,12 +14,15 @@ Submodules:
 from __future__ import annotations
 
 import logging
+import os
 import time
 from typing import Any, List, Optional, Tuple
 
+from . import cylinder as cylinder_module
 from .bullets import (
     clear_bullet_cooldowns,
     classify_error,
+    describe_secret,
     log_event,
     mark_bullet_cooldown,
     probe_provider,
@@ -34,16 +37,19 @@ from .cylinder import (
     REVOLVER_YAML,
     advance,
     cylinders_cache,
+    doctor_revolver_config,
     format_graph,
     get_active_delegation,
     get_active_delegation_dict,
+    get_health_snapshot,
     is_cylinder_in_cooldown,
+    load_error_policy,
     load_revolver_yaml,
     load_state,
+    resolve_active_delegation,
     save_state,
     start_recovery_check,
     stop_recovery_thread,
-    _pending_recovery_message,
 )
 
 logger = logging.getLogger(__name__)
@@ -62,10 +68,12 @@ def register(ctx) -> None:
     # Load cylinder definitions (validated once at startup)
     try:
         _cylinders: List[CylinderDef] = load_revolver_yaml()
+        _error_policy: dict = load_error_policy()
         logger.info("[revolver] Loaded %d cylinder(s) from revolver.yaml", len(_cylinders))
     except Exception as exc:
         logger.error("[revolver] Failed to load revolver.yaml (%s); plugin disabled", exc)
         _cylinders = []
+        _error_policy = {}
 
     # Load or initialise persistent state
     _state: CylinderState = load_state()
@@ -101,12 +109,10 @@ def register(ctx) -> None:
     @ctx.on("on_session_start")
     def on_session_start(session_id: str = "") -> None:
         """Log current cylinder/bullet on session start."""
-        global _pending_recovery_message
-
         # Check for pending recovery message from background thread
-        if _pending_recovery_message is not None:
-            ctx.inject_message(_pending_recovery_message, role="user")
-            _pending_recovery_message = None
+        if cylinder_module._pending_recovery_message is not None:
+            ctx.inject_message(cylinder_module._pending_recovery_message, role="user")
+            cylinder_module._pending_recovery_message = None
 
         if not _cylinders:
             logger.info("[revolver] No cylinders configured")
@@ -114,10 +120,9 @@ def register(ctx) -> None:
         s = load_state()
         model, provider, api_key = get_active_delegation(_cylinders, s)
         if model:
-            key_preview = (api_key[:8] + "...") if api_key else "(none)"
             logger.info(
                 "[revolver] Session %s — active: %s / %s [key=%s] bullet=%d/%d state=%s",
-                session_id or "(unknown)", provider, model, key_preview,
+                session_id or "(unknown)", provider, model, describe_secret(api_key),
                 s.bullet, len(_cylinders[s.cylinder].bullets) if s.cylinder < len(_cylinders) else 0,
                 s.state,
             )
@@ -169,7 +174,7 @@ def register(ctx) -> None:
         if not _cylinders:
             return
 
-        action = classify_error(status_code)
+        action = classify_error(status_code, _error_policy)
         logger.info(
             "[revolver] api_request_error — status=%s action=%s model=%s provider=%s",
             status_code, action, model, provider,
@@ -321,11 +326,25 @@ def register(ctx) -> None:
                     recovery_interval = 300.0
                 start_recovery_check(recovery_interval)
 
+        def _rotation_message(s: CylinderState) -> str:
+            if s.state == "ALL_EXHAUSTED" or s.cylinder >= len(_cylinders):
+                return (
+                    f"[revolver] After {status_code} ({action}): delegation config changed. "
+                    f"state=ALL_EXHAUSTED; no provider/model is currently available. "
+                    f"Do not keep using the previous delegation target; ask for /revolver reset "
+                    f"or wait for recovery."
+                )
+            active = _cylinders[s.cylinder]
+            return (
+                f"[revolver] After {status_code} ({action}): delegation config changed. "
+                f"Use provider={active.provider} model={active.model} for the next delegated "
+                f"request. cylinder={s.cylinder} bullet={s.bullet} state={s.state} "
+                f"auth={describe_secret(active.get_bullet_key(s.bullet))}."
+            )
+
         if acquired:
             ctx.inject_message(
-                f"[revolver] After {status_code} ({action}): "
-                f"cylinder={new_state.cylinder} bullet={new_state.bullet} "
-                f"state={new_state.state}",
+                _rotation_message(new_state),
                 role="user",
             )
         else:
@@ -346,6 +365,8 @@ def register(ctx) -> None:
         if not _state.cylinder < len(_cylinders):
             return "[revolver] ALL_EXHAUSTED — /revolver reset to recover"
 
+        transition = {"status": ""}
+
         def _fn(s: CylinderState) -> CylinderState:
             result_state, status = advance(_cylinders, s)
             if status == "ALL_COOLDOWN":
@@ -357,7 +378,8 @@ def register(ctx) -> None:
                     bullet_cooldowns=result_state.bullet_cooldowns,
                     consecutive_failures=result_state.consecutive_failures,
                 )
-                result_state, _ = advance(_cylinders, result_state)
+                result_state, status = advance(_cylinders, result_state)
+            transition["status"] = status
             return result_state
 
         new_state, acquired = _mutate(_fn)
@@ -392,13 +414,13 @@ def register(ctx) -> None:
                 f"[revolver] Advanced to ALL_EXHAUSTED — "
                 f"no more cylinders; /revolver reset to recover"
             )
-        elif status == "EXHAUSTED":
+        elif transition["status"] == "EXHAUSTED":
             log_event("cylinder_exhausted", log_ctx)
         else:
             log_event("bullet_advanced", log_ctx)
         cyl = _cylinders[new_state.cylinder]
         key = cyl.get_bullet_key(new_state.bullet)
-        key_info = f" key={key[:8]}..." if key else " key=(none)"
+        key_info = f" key={describe_secret(key)}"
         return (
             f"[revolver] next — cylinder={new_state.cylinder} "
             f"bullet={new_state.bullet}/{len(cyl.bullets)}{key_info} "
@@ -420,7 +442,7 @@ def register(ctx) -> None:
             return "[revolver] No cylinders configured"
         s = load_state()
         model, provider, api_key = get_active_delegation(_cylinders, s)
-        key_info = f" api_key={api_key[:8]}..." if api_key else " api_key=(none)"
+        key_info = f" api_key={describe_secret(api_key)}"
         cooldown_info = ""
         if s.cooldown_until > 0 and time.time() < s.cooldown_until:
             remaining = int(s.cooldown_until - time.time())
@@ -533,7 +555,8 @@ def register(ctx) -> None:
             f"  bullet   : {result['bullet']}\n"
             f"  state    : {result['state']}\n"
             f"  provider : {result['provider']}\n"
-            f"  model    : {result['model']}"
+            f"  model    : {result['model']}\n"
+            f"  apply    : provider={result['apply']['provider']} model={result['apply']['model']}"
         )
 
     ctx.register_command(
@@ -543,19 +566,125 @@ def register(ctx) -> None:
     )
 
     # -------------------------------------------------------------------------
+    # /revolver health  — operational health snapshot
+    # -------------------------------------------------------------------------
+    def _cmd_health() -> str:
+        """Show active routing, cooldowns, and recent event counts."""
+        if not _cylinders:
+            return "[revolver] No cylinders configured"
+        snapshot = get_health_snapshot(_cylinders, load_state())
+        active = snapshot["active_delegation"]
+        lines = [
+            "[revolver] Health",
+            f"  ok       : {snapshot['ok']}",
+            f"  state    : {snapshot['state']}",
+            f"  cylinders: {snapshot['cylinders']}",
+        ]
+        if active.get("active"):
+            lines.append(
+                f"  apply    : provider={active['apply']['provider']} model={active['apply']['model']}"
+            )
+        else:
+            lines.append("  apply    : none")
+        if snapshot["cooldowns"]:
+            for cooldown in snapshot["cooldowns"]:
+                lines.append(
+                    f"  cooldown : bullet={cooldown['bullet']} "
+                    f"remaining={cooldown['remaining_seconds']}s auth={cooldown['auth_type']}"
+                )
+        else:
+            lines.append("  cooldown : none")
+        if snapshot["recent_event_counts"]:
+            counts = ", ".join(
+                f"{name}={count}" for name, count in sorted(snapshot["recent_event_counts"].items())
+            )
+            lines.append(f"  events   : {counts}")
+        else:
+            lines.append("  events   : none")
+        return "\n".join(lines)
+
+    ctx.register_command(
+        "revolver-health",
+        _cmd_health,
+        description="Show revolver health, active routing, cooldowns, and recent event counts",
+    )
+
+    # -------------------------------------------------------------------------
+    # /revolver doctor  — setup and safety checks
+    # -------------------------------------------------------------------------
+    def _cmd_doctor() -> str:
+        """Validate config, policy, and local safety settings."""
+        report = doctor_revolver_config()
+        lines = [
+            "[revolver] Doctor",
+            f"  ok       : {report['ok']}",
+            f"  config   : {report['config_path']}",
+            f"  cylinders: {report['cylinders']}",
+            f"  bullets  : {report['bullets']}",
+        ]
+        for error in report["errors"]:
+            lines.append(f"  error    : {error}")
+        for warning in report["warnings"]:
+            lines.append(f"  warning  : {warning}")
+        if not report["errors"] and not report["warnings"]:
+            lines.append("  findings : none")
+        return "\n".join(lines)
+
+    ctx.register_command(
+        "revolver-doctor",
+        _cmd_doctor,
+        description="Validate Revolver config, policy, and local safety settings",
+    )
+
+    # -------------------------------------------------------------------------
     # Tool: get_active_delegation  — exposes active cylinder config to host agent
     # -------------------------------------------------------------------------
     def _tool_get_active_delegation() -> dict:
-        """Return active delegation config as {model, provider, cylinder, bullet, state}."""
+        """Return active delegation config as an enforceable routing contract."""
         if not _cylinders:
             return {"error": "No cylinders configured"}
         s = load_state()
         return get_active_delegation_dict(_cylinders, s)
 
+    def _tool_resolve_delegation() -> dict:
+        """Return the active provider/model contract for the next delegated request."""
+        if not _cylinders:
+            return {"error": "No cylinders configured"}
+        s = load_state()
+        return resolve_active_delegation(_cylinders, s, include_secret=False)
+
+    def _tool_get_revolver_health() -> dict:
+        """Return a redacted operational health snapshot."""
+        if not _cylinders:
+            return {"error": "No cylinders configured"}
+        return get_health_snapshot(_cylinders, load_state())
+
+    def _tool_doctor_revolver() -> dict:
+        """Return setup and safety validation findings."""
+        return doctor_revolver_config()
+
     ctx.register_tool(
         name="get_active_delegation",
         handler=_tool_get_active_delegation,
-        description="Return the currently active delegation model and provider from revolver",
+        description="Return the currently active delegation routing contract from revolver",
+    )
+
+    ctx.register_tool(
+        name="resolve_delegation",
+        handler=_tool_resolve_delegation,
+        description="Resolve the provider/model that the host must apply to the next delegated request",
+    )
+
+    ctx.register_tool(
+        name="get_revolver_health",
+        handler=_tool_get_revolver_health,
+        description="Return revolver health, active routing, cooldowns, and recent event counts",
+    )
+
+    ctx.register_tool(
+        name="doctor_revolver",
+        handler=_tool_doctor_revolver,
+        description="Validate Revolver config, policy, and local safety settings",
     )
 
     # -------------------------------------------------------------------------
@@ -596,6 +725,8 @@ def register(ctx) -> None:
             result["type"] = btype
         if cooldown is not None:
             result["cooldown_seconds"] = cooldown
+        if b.get("label"):
+            result["label"] = b["label"]
         return result
 
     def _cylinder_to_raw(c: CylinderDef) -> dict:
@@ -615,7 +746,14 @@ def register(ctx) -> None:
         try:
             raw = {"cylinders": [_cylinder_to_raw(c) for c in cyl_list]}
             import yaml as _yaml
-            with open(REVOLVER_YAML, "w") as fh:
+            if REVOLVER_YAML.exists():
+                with open(REVOLVER_YAML, "r") as existing_fh:
+                    existing = _yaml.safe_load(existing_fh)
+                if isinstance(existing, dict) and "error_policy" in existing:
+                    raw["error_policy"] = existing["error_policy"]
+            REVOLVER_YAML.parent.mkdir(parents=True, exist_ok=True)
+            fd = os.open(str(REVOLVER_YAML), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w") as fh:
                 _yaml.dump(raw, fh, default_flow_style=False, sort_keys=False, allow_unicode=True)
             return ""
         except Exception as exc:
@@ -624,9 +762,10 @@ def register(ctx) -> None:
 
     def _reload_cylinders() -> str:
         """Reload _cylinders from disk. Return error msg or empty string."""
-        nonlocal _cylinders
+        nonlocal _cylinders, _error_policy
         try:
             _cylinders = load_revolver_yaml()
+            _error_policy = load_error_policy()
             logger.info("[revolver] Reloaded %d cylinder(s)", len(_cylinders))
             return ""
         except Exception as exc:
@@ -795,7 +934,7 @@ def register(ctx) -> None:
             lines = [f"[revolver] Cylinder [{idx}] {c.provider}/{c.model} — bullets:"]
             for bi, b in enumerate(c.bullets):
                 key = b.get("key", "")
-                key_preview = key[:12] + "..." if len(key) > 16 else key
+                key_preview = describe_secret(key)
                 btype = b.get("type", "bearer")
                 cooldown = b.get("cooldown_seconds")
                 extra = f" type={btype}" if btype != "bearer" else ""
@@ -838,8 +977,7 @@ def register(ctx) -> None:
             msg = _reload_cylinders()
             if msg:
                 return f"[revolver] Written but {msg}"
-            key_preview = key[:12] + "..." if len(key) > 16 else key
-            return f"[revolver] Added bullet [{len(c.bullets)}] {key_preview} to cylinder [{cyl_idx}]"
+            return f"[revolver] Added bullet [{len(c.bullets)}] to cylinder [{cyl_idx}]"
 
         elif subcmd == "edit":
             if len(parts) < 3:
