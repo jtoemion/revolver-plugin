@@ -174,6 +174,16 @@ def register(ctx) -> None:
         if not _cylinders:
             return
 
+        # Already exhausted — injecting a message would trigger another agent
+        # API call, which would 429 again, which would inject again. Stop here.
+        _current = load_state()
+        if _current.state == "ALL_EXHAUSTED" or _current.cylinder >= len(_cylinders):
+            logger.info(
+                "[revolver] api_request_error ignored — already ALL_EXHAUSTED (status=%s)",
+                status_code,
+            )
+            return
+
         action = classify_error(status_code, _error_policy)
         logger.info(
             "[revolver] api_request_error — status=%s action=%s model=%s provider=%s",

@@ -406,6 +406,19 @@ if __name__ == "__main__":
     assert doctor["ok"] is True, doctor
     print("   OK - injected message is explicit and does not leak the key")
 
+    print("14. ALL_EXHAUSTED loop-break: repeated 429s must not re-inject ...")
+    save_state(CylinderState(cylinder=99, bullet=-1, state="ALL_EXHAUSTED"))
+    fake_ctx2 = FakeCtx()
+    register(fake_ctx2)
+    before = len(fake_ctx2.messages)
+    fake_ctx2.hooks["api_request_error"](status_code=429, model="x", provider="y")
+    fake_ctx2.hooks["api_request_error"](status_code=429, model="x", provider="y")
+    fake_ctx2.hooks["api_request_error"](status_code=429, model="x", provider="y")
+    assert len(fake_ctx2.messages) == before, (
+        f"ALL_EXHAUSTED should suppress inject, got {len(fake_ctx2.messages) - before} extra messages"
+    )
+    print("   OK - no inject when already ALL_EXHAUSTED")
+
     # Clean up test state file
     if STATE_FILE.exists():
         STATE_FILE.unlink()
